@@ -378,4 +378,4 @@ if __name__ == "__main__":
     update_ips_file_with_short_name()
     devices = load_ips()
     threading.Thread(target=polling_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)                               <-------------------- ## You can change the TCP port that allowed on your Network or Firewall
+    app.run(host="0.0.0.0", port=5000)                                ## <------You can change the TCP port that allowed on your Network or Firewall
