@@ -5,6 +5,10 @@ Designed for labs, NOCs, and small-to-medium environments where simplicity and v
 
 ---
 
+
+pip install -r requirements.txt
+
+
 ## 🚀 Features
 
 - ✅ Real-time IP reachability monitoring
