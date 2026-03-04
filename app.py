@@ -11,11 +11,14 @@ app = Flask(__name__)
 PING_INTERVAL = 5          # seconds
 PING_COUNT = 3             # pings per poll
 LOSS_THRESHOLD = 1         # tolerated failures
+IPS_RELOAD_INTERVAL = 300  # 5 minutes
 
 devices = {}
+devices_lock = threading.Lock()   # NEW (thread safety)
 EXCEL_FILE = "device_status.xlsx"
 IPS_FILE = "ips.txt"
-full_log = []   # UP / DOWN / LOSS changes only
+full_log = []
+
 
 # ---------------- UPDATE EXISTING IPS ----------------
 def update_ips_file_with_short_name():
@@ -34,6 +37,7 @@ def update_ips_file_with_short_name():
     if updated:
         with open(IPS_FILE, "w") as f:
             f.write("\n".join(lines))
+
 
 # ---------------- LOAD IPS ----------------
 def load_ips():
@@ -58,10 +62,38 @@ def load_ips():
             }
     return devs
 
+
+# ---------------- AUTO RELOAD IPS ----------------
+def ips_reload_loop():
+    global devices
+
+    while True:
+        time.sleep(IPS_RELOAD_INTERVAL)
+
+        file_devices = load_ips()
+        file_ips = set(file_devices.keys())
+
+        with devices_lock:
+            current_ips = set(devices.keys())
+
+            # --- Add new IPs ---
+            for ip in file_ips - current_ips:
+                devices[ip] = file_devices[ip]
+                print(f"[AUTO-RELOAD] Added: {ip}")
+
+            # --- Remove deleted IPs ---
+            for ip in current_ips - file_ips:
+                devices.pop(ip, None)
+                print(f"[AUTO-RELOAD] Removed: {ip}")
+
+        print("[AUTO-RELOAD] Sync completed.")
+
+
 # ---------------- SAVE IP ----------------
 def save_ip(ip, name, group, short):
     with open(IPS_FILE, "a") as f:
         f.write(f"{ip},{name},{group},{short}\n")
+
 
 # ---------------- MULTI-PING ----------------
 def ping_device(ip):
@@ -91,43 +123,51 @@ def ping_device(ip):
     else:
         return "up", avg_latency
 
+
 # ---------------- POLLING ----------------
 def polling_loop():
     while True:
-        for ip, d in devices.items():
+        with devices_lock:
+            ips_list = list(devices.keys())
+
+        for ip in ips_list:
+            with devices_lock:
+                d = devices.get(ip)
+                if not d:
+                    continue
+
             status_now, latency = ping_device(ip)
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # tooltip history
-            if not d["history"] or d["history"][-1]["status"] != status_now:
-                d["history"].append({"status": status_now, "time": now})
-                if len(d["history"]) > 3:
-                    d["history"].pop(0)
+            with devices_lock:
+                if not d["history"] or d["history"][-1]["status"] != status_now:
+                    d["history"].append({"status": status_now, "time": now})
+                    if len(d["history"]) > 3:
+                        d["history"].pop(0)
 
-            # loss tracking
-            if status_now == "loss":
-                if not d["is_loss"]:
-                    d["loss_since"] = now
-                d["is_loss"] = True
-            else:
-                d["is_loss"] = False
-                d["loss_since"] = None
+                if status_now == "loss":
+                    if not d["is_loss"]:
+                        d["loss_since"] = now
+                    d["is_loss"] = True
+                else:
+                    d["is_loss"] = False
+                    d["loss_since"] = None
 
-            # log state change
-            if d["last_logged_status"] != status_now:
-                full_log.append({
-                    "IP": ip,
-                    "Name": d["name"],
-                    "Group": d["group"],
-                    "Status": status_now,
-                    "Time": now
-                })
-                d["last_logged_status"] = status_now
+                if d["last_logged_status"] != status_now:
+                    full_log.append({
+                        "IP": ip,
+                        "Name": d["name"],
+                        "Group": d["group"],
+                        "Status": status_now,
+                        "Time": now
+                    })
+                    d["last_logged_status"] = status_now
 
-            d["status"] = status_now
-            d["latency"] = latency
+                d["status"] = status_now
+                d["latency"] = latency
 
         time.sleep(PING_INTERVAL)
+
 
 # ---------------- ROUTES ----------------
 @app.route("/")
@@ -136,65 +176,85 @@ def index():
 
 @app.route("/status")
 def status():
-    return jsonify(devices)
+    with devices_lock:
+        return jsonify(devices)
 
 @app.route("/events")
 def events():
     return jsonify(full_log[-100:][::-1])
 
+
 @app.route("/add", methods=["POST"])
 def add():
     ip = request.form["ip"].strip()
 
-    if ip not in devices:
-        # ---- immediate first check ----
-        status_now, latency = ping_device(ip)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with devices_lock:
+        if ip in devices:
+            return redirect("/")
 
-        devices[ip] = {
-            "name": request.form.get("name", ip),
-            "group": request.form.get("group", "Default"),
-            "short_name": request.form.get("short_name", ""),
+    status_now, latency = ping_device(ip)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # set REAL state immediately
-            "status": status_now,
-            "latency": latency,
-            "history": [{"status": status_now, "time": now}],
-            "last_logged_status": status_now,
+    new_device = {
+        "name": request.form.get("name", ip),
+        "group": request.form.get("group", "Default"),
+        "short_name": request.form.get("short_name", ""),
+        "status": status_now,
+        "latency": latency,
+        "history": [{"status": status_now, "time": now}],
+        "last_logged_status": status_now,
+        "is_loss": status_now == "loss",
+        "loss_since": now if status_now == "loss" else None
+    }
 
-            # loss tracking
-            "is_loss": status_now == "loss",
-            "loss_since": now if status_now == "loss" else None
-        }
+    with devices_lock:
+        devices[ip] = new_device
 
-        # log first event
-        full_log.append({
-            "IP": ip,
-            "Name": devices[ip]["name"],
-            "Group": devices[ip]["group"],
-            "Status": status_now,
-            "Time": now
-        })
+    full_log.append({
+        "IP": ip,
+        "Name": new_device["name"],
+        "Group": new_device["group"],
+        "Status": status_now,
+        "Time": now
+    })
 
-        save_ip(
-            ip,
-            devices[ip]["name"],
-            devices[ip]["group"],
-            devices[ip]["short_name"]
-        )
+    save_ip(ip, new_device["name"], new_device["group"], new_device["short_name"])
 
     return redirect("/")
 
+
+#@app.route("/export")
+#def export():
+#    df = pd.DataFrame(full_log)
+#    df.to_excel(EXCEL_FILE, index=False)
+#    wb = openpyxl.load_workbook(EXCEL_FILE)
+#    ws = wb.active
+#    for col in ws.columns:
+#        ws.column_dimensions[col[0].column_letter].width = 22
+#    wb.save(EXCEL_FILE)
+#    return send_file(EXCEL_FILE, as_attachment=True)
+
 @app.route("/export")
 def export():
+    if not full_log:
+        return "No data to export", 400
+
     df = pd.DataFrame(full_log)
-    df.to_excel(EXCEL_FILE, index=False)
-    wb = openpyxl.load_workbook(EXCEL_FILE)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"device_status_{timestamp}.xlsx"
+    filepath = os.path.join("/tmp", filename)
+
+    df.to_excel(filepath, index=False)
+
+    wb = openpyxl.load_workbook(filepath)
     ws = wb.active
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 22
-    wb.save(EXCEL_FILE)
-    return send_file(EXCEL_FILE, as_attachment=True)
+    wb.save(filepath)
+
+    return send_file(filepath, as_attachment=True)
+
 
 # ---------------- HTML ----------------
 PAGE_HTML = """
@@ -342,7 +402,7 @@ fetch("/status").then(r=>r.json()).then(d=>{
     let cls=x.status=="loss"?"loss":x.status;
     let hist=encodeURIComponent(JSON.stringify(x.history));
     html+=`<div><div style="font-size:11px;color:white">${x.short_name||""}</div>
-    <div class="box ${cls}" 
+    <div class="box ${cls}"
     onmousemove="showTip(event,'${x.ip}','${x.name}','${x.group}','${x.status}','${x.latency}','${hist}','${x.loss_since||""}')"
     onmouseleave="hideTip()"></div></div>`;
   });
@@ -377,5 +437,8 @@ setInterval(loadEvents,5000);
 if __name__ == "__main__":
     update_ips_file_with_short_name()
     devices = load_ips()
+
     threading.Thread(target=polling_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)                                ## <------You can change the TCP port that allowed on your Network or Firewall
+    threading.Thread(target=ips_reload_loop, daemon=True).start()   # NEW THREAD
+
+    app.run(host="0.0.0.0", port=5000)
